@@ -1,0 +1,80 @@
+name: Deploy Task Management System
+
+on:
+  push:
+    branches: [ "main" ] # Tự động chạy khi bạn push code vào nhánh main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Đăng nhập Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 1. Build & Push Image Backend lên Docker Hub
+      - name: Build and Push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/task-backend:latest
+
+      # 2. Build & Push Image Frontend lên Docker Hub (Có nạp biến Secret)
+      - name: Build and Push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/task-frontend:latest
+          # Truyền biến môi trường ẩn từ GitHub Secrets vào quá trình build đóng gói của Vite
+          build-args: |
+            VITE_APP_BASE_URL=${{ secrets.VITE_APP_BASE_URL }}
+            VITE_APP_FIREBASE_API_KEY=${{ secrets.VITE_APP_FIREBASE_API_KEY }}
+
+  deploy-to-ec2:
+    runs-on: ubuntu-latest
+    needs: build-and-push # Đợi bước build thành công mới tiến hành deploy
+    steps:
+      - name: SSH vào máy chủ EC2 và cập nhật ứng dụng
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 1. Dừng và xóa bỏ các Container cũ đang chạy (nếu có)
+            sudo docker stop task-backend task-frontend || true
+            sudo docker rm task-backend task-frontend || true
+            
+            # 2. Dọn dẹp dứt điểm các Image cũ (Dangling images) để giải phóng dung lượng EC2
+            sudo docker image prune -f
+            
+            # 3. Kéo các phiên bản Image mới nhất vừa build từ Docker Hub về máy chủ EC2
+            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/task-backend:latest
+            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/task-frontend:latest
+            
+            # 4. Khởi chạy Container Backend
+            # Chỉ cho phép lắng nghe nội bộ tại cổng 8800 (127.0.0.1:8800), chặn truy cập trực tiếp từ IP ngoại vi
+            sudo docker run -d \
+              --name task-backend \
+              -p 8800:8800 \
+              -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
+              -e JWT_SECRET=your_jwt_secret \
+              -e PORT=8800 \
+              -e NODE_ENV=production \
+              ${{ secrets.DOCKER_USERNAME }}/task-backend:latest
+              
+            # 5. Khởi chạy Container Frontend
+            # Chỉ cho phép lắng nghe nội bộ tại cổng 8080 để nhường cổng 80/443 thực tế cho Nginx gác cổng
+            sudo docker run -d \
+              --name task-frontend \
+              -p 3000:80 \
+              ${{ secrets.DOCKER_USERNAME }}/task-frontend:latest
